@@ -8,6 +8,8 @@ from klampt.model import coordinates
 from klampt.vis import GLRealtimeProgram
 import math
 import numpy as np
+# from threading import Thread, Lock, RLock
+
 # from klampt.sim import *
 
 # world = WorldModel()
@@ -29,15 +31,15 @@ class CartPoleEnv():
         prevent it from falling over by increasing and reducing the cart's
         velocity.
     """
-    def __init__(self, world, sim):
-        self.sim = sim
+    def __init__(self, world):
+        self.robot = world.robot(0)
         self.max_acc = 5.0  # action
         self.gravity = 9.81
-        self.masscart = 1
-        self.masspole = 17
-        self.total_mass = self.masspole + self.masscart
-        self.length = 0.5  # actually half the pole's length
+        self.masscart = self.robot.link(11).getMass().mass + self.robot.link(8).getMass().mass
+        self.total_mass = sum(self.robot.link(i).getMass().mass for i in range(self.robot.numLinks()))
+        self.masspole = self.total_mass - self.masscart
 
+        self.length = 0.5  # actually half the pole's length
         self.polemass_length = self.masspole * self.length
         self.force_mag = 10.0
         self.tau = 0.02  # seconds between state updates
@@ -47,44 +49,13 @@ class CartPoleEnv():
         self.theta_threshold_radians = 12 * 2 * math.pi / 360
         self.x_threshold = 30
         self.robot = world.robot(0)
-
-
-        # Angle limit set to 2 * theta_threshold_radians so failing observation
-        # is still within bounds.
-        # high = np.array(
-        #     [
-        #         self.x_threshold * 2,
-        #         np.finfo(np.float32).max,
-        #         self.theta_threshold_radians * 2,
-        #         np.finfo(np.float32).max,
-        #     ],
-        #     dtype=np.float32,
-        # )
-
-        # self.action_space = spaces.Box(
-        #     low=-self.max_acc, high=self.max_acc, shape=(1,), dtype=np.float32
-        # )
-        # self.observation_space = spaces.Box(-high, high, dtype=np.float32)
-
-        # self.seed()
-        # self.viewer = None
+        # self._controlLoopLock = RLock()
         self.state = None
-        self.pre_x, self.pre_theta, self.pre_x_dot, self.pre_theta_dot = 0,0,0,0
-
-        # self.steps_beyond_done = None
-
-    # def seed(self, seed=None):
-    #     self.np_random, seed = seeding.np_random(seed)
-    #     return [seed]
 
     def step(self,u):
-        # u = max(min(self.max_acc, u), -u)
-        self.config = self.robot.getConfig()
-        x = self.config[0]
-        x_dot = (self.config[0] - self.pre_x)/self.tau
-        theta = self.config[4]
-        theta_dot = (theta - self.pre_x_dot)/self.tau
-        self.pre_x, self.pre_theta, self.pre_x_dot, self.pre_theta_dot = x, x_dot, theta, theta_dot
+        u = max(min(self.max_acc, u), -u)
+        print("u: ", u)
+        x, theta, x_dot, theta_dot = self.state
         costheta = np.cos(theta)
         sintheta = np.sin(theta)
 
@@ -99,6 +70,8 @@ class CartPoleEnv():
             - self.masspole * self.length * (theta_dot ** 2) * costheta * sintheta
             - self.total_mass * self.gravity * sintheta
         ) / (self.length * self.masscart + self.masspole * (sintheta ** 2))
+        print("x_acc: ",xacc)
+        print("theta_acc: ",thetaacc)
 
         if self.kinematics_integrator == "euler":
             x = x + self.tau * x_dot
@@ -110,9 +83,7 @@ class CartPoleEnv():
             x = x + self.tau * x_dot
             theta_dot = theta_dot + self.tau * thetaacc
             theta = theta + self.tau * theta_dot
-
-        self.state = (x, theta, x_dot, theta_dot)
-        return np.array(self.state)
+        return np.array((x, theta, x_dot, theta_dot))
 
 class InfiniteLQR:
     def __init__(self, A, B, Q, R):
@@ -135,7 +106,7 @@ class InfiniteLQR:
 
 
 class CartPoleController:
-    def __init__(self, CartPoleEnv, state, state_ref):
+    def __init__(self, CartPoleEnv, state_ref):
         # self.step = 0
         self.env = CartPoleEnv
         self.state_ref = state_ref
@@ -160,31 +131,58 @@ class CartPoleController:
         return u[0]
 
 class GLTest(GLRealtimeProgram):
-    def __init__(self,world,sim, controller, env):
+    def __init__(self,world,sim, cartpoleController, env):
         GLRealtimeProgram.__init__(self,"GLTest")
         self.world = world
         self.sim = sim
         self.robot = world.robot(0)
-
+        # self.pre_x, self.pre_theta, self.pre_x_dot, self.pre_theta_dot = 0,0,0,0
+        self.state = None
+        self.controller = sim.controller(0)
 
     def display(self):
         self.sim.updateWorld()
         self.world.drawGL()
 
     def idle(self):
+        # robot.numDrivers(): 6
+        # self.dt: 0.02
+        print("pre-state: ", self.state)
+        self.q = self.controller.getSensedConfig() #self.robot.getConfig()
+        self.dq = self.controller.getSensedVelocity()
+        x = self.q[0]
+        x_dot = self.dq[0]
+        theta = self.q[4]
+        theta_dot = self.dq[4]
+        self.state = (x, theta, x_dot, theta_dot)
+        env.state = self.state
+        print("state: ", self.state)
         # print("simtime: ",sim.getTime())
-        # print("dt: ",self.dt)
         # q=sim.controller(0).getCommandedConfig()
-        # print("q: ",q)
-        action = controller.act(env.state)
-        state = env.step(action)
+        action = cartpoleController.act(self.state)
+        cartpole_config = env.step(action)
+        print("cartpole_config: ",cartpole_config)
+        wheelCondfig = action
         # TODO: transfer state to klampt configuration
-        q = [state[0], 0.0, 0.0, 0.0, state[1], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        sim.controller(0).setMilestone(q)
-        # self.robot.setConfig(q) 
-        sim.simulate(self.dt)
+        # q = [0.0, 0.0, cartpole_config[0],  0.0, cartpole_config[1],  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        # dq = [ 0.0, 0.0, cartpole_config[2], 0.0, cartpole_config[3],  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        print("state: ", self.robot.getConfig())
+        q = [cartpole_config[0], 0.0, 0.0,  0.0, cartpole_config[1],  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        dq = [cartpole_config[2], 0.0, 0.0, 0.0, cartpole_config[3],  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        # q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, wheelCondfig, 0.0, 0.0, wheelCondfig]
+        # dq = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        # sim.controller(0).setPIDCommand(q,dq)
+        self.controller.addCubic(q, dq, self.dt)
+        # self.controller.setPIDCommand(q, dq)
+        # print("getCommandedConfig(): ", self.controller.getCommandedConfig())
+        # print("getCommandedVelocity(): ", self.controller.getCommandedVelocity())
+        print("getSensedConfig(): ", self.controller.getSensedConfig())
+        print("config state: ", self.robot.getConfig())
+        print("getSensedVelocity(): ", self.controller.getSensedVelocity())
+        print("getCommandedVelocity(): ", self.controller.getCommandedVelocity())
+        sim.simulate(self.dt)
         return
 
 if __name__ == "__main__":
@@ -194,7 +192,7 @@ if __name__ == "__main__":
         raise RuntimeError("Unable to load world")
     sim = klampt.Simulator(world)
     state_ref = np.array([0, 0, 0, 0])
-    env = CartPoleEnv(world, sim)
+    env = CartPoleEnv(world)
     env.state = state_ref
-    controller = CartPoleController(env, env.state, state_ref)
-    GLTest(world,sim,controller,env).run()
+    cartpoleController = CartPoleController(env, state_ref)
+    GLTest(world,sim,cartpoleController,env).run()
